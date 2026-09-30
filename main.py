@@ -1,17 +1,23 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 import pytesseract
 from PIL import Image, ImageOps, ImageFilter
 import requests
 from io import BytesIO
+import asyncio
+import datetime
 import re
 import json
 import os
+import unicodedata
 from collections import defaultdict
 
 # ---------------- CONFIG ---------------- #
 intents = discord.Intents.default()
 intents.message_content = True
+# Facultatif : archiver les salons FM d'un joueur qui quitte le serveur. Demande d'activer
+# "Server Members Intent" dans le portail developpeur Discord, puis FM_MEMBERS_INTENT=1.
+intents.members = os.environ.get("FM_MEMBERS_INTENT") == "1"
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 sessions = {}
@@ -28,6 +34,35 @@ LINE_PATTERN = re.compile(
     re.IGNORECASE
 )
 
+# ---------------- CONFIG DOFUS CRAFT (facultative) ---------------- #
+# Envoi des sessions au site Dofus Craft. Sans ces deux variables, le bot
+# fonctionne exactement comme avant : rien n'est envoye nulle part.
+SITE_URL = os.environ.get("DOFUS_CRAFT_API_URL", "").rstrip("/")
+SITE_KEY = os.environ.get("FM_BOT_API_KEY", "")
+SITE_ENABLED = bool(SITE_URL and SITE_KEY)
+
+# Salons FM personnels : actives par FM_PERSONAL_CHANNELS=1. Le bot cree alors lui-meme
+# les categories "Forgemagie" et "Archives FM" et le salon d'accueil #forgemagie (ou reprend
+# ceux qui existent deja sous ces noms). Sinon, les commandes /fm... marchent comme avant.
+def _int_env(name, default=0):
+    try:
+        return int(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+FM_PERSONAL_CHANNELS = os.environ.get("FM_PERSONAL_CHANNELS") == "1"
+# Seulement si le bot est sur plusieurs serveurs : celui ou creer les salons FM.
+FM_GUILD_ID = _int_env("FM_GUILD_ID")
+FM_MAX_ACTIVE_CHANNELS = _int_env("FM_MAX_ACTIVE_CHANNELS", 5)
+FM_INACTIVITY_DAYS = _int_env("FM_INACTIVITY_DAYS", 14)
+
+FM_CATEGORY_NAME = "Forgemagie"
+FM_ARCHIVE_CATEGORY_NAME = "Archives FM"
+FM_WELCOME_CHANNEL_NAME = "forgemagie"
+
+MAX_CHANNEL_NAME = 30
+NEW_SESSION_BUTTON_ID = "fm:new-session"
+
 # ---------------- DATA ---------------- #
 def save_data():
     with open("data.json", "w") as f:
@@ -40,6 +75,24 @@ def load_data():
             sessions = json.load(f)
     except Exception:
         sessions = {}
+
+# Les salons FM personnels sont ranges dans data.json sous la cle "_fm" (jamais un
+# identifiant de salon), pour survivre aux redemarrages avec le volume docker actuel.
+def fm_state():
+    state = sessions.setdefault("_fm", {})
+    state.setdefault("channels", {})
+    return state
+
+def fm_channels():
+    return fm_state()["channels"]
+
+def now_iso():
+    return discord.utils.utcnow().isoformat()
+
+def touch_channel(channel_id):
+    entry = fm_channels().get(str(channel_id))
+    if entry and entry.get("status") == "active":
+        entry["last_activity"] = now_iso()
 
 # ---------------- PRETRAITEMENT IMAGE ---------------- #
 def preprocess_image(img: Image.Image, scale: int = 3) -> Image.Image:
@@ -60,7 +113,7 @@ def preprocess_image(img: Image.Image, scale: int = 3) -> Image.Image:
     return img
 
 def clean_number(raw: str) -> int:
-    cleaned = raw.replace(" ", "").replace("\u202f", "").replace("\xa0", "")
+    cleaned = raw.replace(" ", "").replace(" ", "").replace("\xa0", "")
     return int(cleaned)
 
 # ---------------- EXTRACTION ---------------- #
@@ -161,13 +214,380 @@ async def send_rune_embeds(send_func, runes, title="Detail des runes"):
     for embed in build_rune_embeds(runes, title=title):
         await send_func(embed=embed)
 
+# Texte du resume d'une session, commun a /fmstop, /fmtotal, a la fermeture
+# demandee par le site et a /fmarchive.
+def session_summary(session, title):
+    users = session["users"]
+    if users:
+        resume = "\n".join(
+            [f"<@{uid}> : {format_number(val)}" for uid, val in users.items()]
+        )
+    else:
+        resume = "Aucune donnee."
+    return f"{title}\n\n{resume}\n\nTOTAL : {format_number(session['total'])} kamas"
+
+# Ferme la session d'un salon en publiant le meme resume que /fmstop.
+async def close_session_in_channel(channel):
+    channel_id = str(channel.id)
+    session = sessions.pop(channel_id, None)
+    save_data()
+    if session is None:
+        return False
+    await channel.send(session_summary(session, "Resume final"))
+    if session.get("runes"):
+        await send_rune_embeds(channel.send, session["runes"])
+    return True
+
+# ---------------- SITE DOFUS CRAFT ---------------- #
+# Chaque envoi part en arriere-plan : le bot ne bloque jamais, meme si le site
+# est lent ou en panne. Un envoi rate est retente plus tard ; le site ignore les
+# doublons grace a eventId (l'identifiant du message ou de l'interaction Discord).
+pending_events = []
+handled_commands = set()
+
+def _site_request(method, path, payload=None):
+    return requests.request(
+        method,
+        f"{SITE_URL}{path}",
+        json=payload,
+        headers={"Authorization": f"Bearer {SITE_KEY}"},
+        timeout=10,
+    )
+
+async def site_request(method, path, payload=None):
+    if not SITE_ENABLED:
+        return None
+    try:
+        return await asyncio.to_thread(_site_request, method, path, payload)
+    except Exception as error:
+        print(f"[Dofus Craft] {method} {path} a echoue : {error}")
+        return None
+
+def site_event(event_type, event_id, channel, occurred_at=None, **fields):
+    return {
+        "type": event_type,
+        "eventId": str(event_id),
+        "channelId": str(channel.id),
+        "channelName": channel.name,
+        "occurredAt": (occurred_at or discord.utils.utcnow()).isoformat(),
+        **fields,
+    }
+
+def site_author(user):
+    return {
+        "id": str(user.id),
+        "displayName": user.display_name,
+        "avatarUrl": str(user.display_avatar.url),
+    }
+
+async def send_event(payload):
+    if not SITE_ENABLED:
+        return
+    response = await site_request("POST", "/fm/bot/events", payload)
+    if response is None or response.status_code >= 500:
+        pending_events.append(payload)
+    elif response.status_code >= 400:
+        print(f"[Dofus Craft] evenement refuse ({response.status_code}) : {response.text[:200]}")
+
+async def flush_pending_events():
+    while pending_events:
+        payload = pending_events[0]
+        response = await site_request("POST", "/fm/bot/events", payload)
+        if response is None or response.status_code >= 500:
+            return
+        pending_events.pop(0)
+
+async def ack_command(command_id, status, error=None, channel_id=None):
+    body = {"status": status}
+    if error:
+        body["error"] = error[:200]
+    if channel_id:
+        body["channelId"] = str(channel_id)
+    response = await site_request("POST", f"/fm/bot/commands/{command_id}/ack", body)
+    return response is not None and response.status_code in (200, 404)
+
+# ---------------- SALONS FM PERSONNELS ---------------- #
+def slugify(text):
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii").lower()
+    text = re.sub(r"[^a-z0-9]+", "-", text)
+    return text.strip("-")
+
+def active_channels_of(user_id):
+    return [
+        channel_id for channel_id, entry in fm_channels().items()
+        if entry.get("owner_id") == str(user_id) and entry.get("status") == "active"
+    ]
+
+class ChannelError(Exception):
+    """Une creation de salon impossible, avec le message a montrer au joueur."""
+
+def fm_guild():
+    if not FM_PERSONAL_CHANNELS:
+        return None
+    if FM_GUILD_ID:
+        return bot.get_guild(FM_GUILD_ID)
+    return bot.guilds[0] if len(bot.guilds) == 1 else None
+
+# Un des emplacements des salons FM, retrouve par l'identifiant garde dans data.json.
+def fm_place(key, kind):
+    channel = bot.get_channel(int(fm_state().get(key) or 0))
+    return channel if isinstance(channel, kind) else None
+
+async def ensure_fm_places():
+    """Trouve ou cree les categories Forgemagie et Archives FM et le salon d'accueil."""
+    guild = fm_guild()
+    if guild is None:
+        print("[Salons FM] Serveur introuvable : indique FM_GUILD_ID si le bot est sur plusieurs serveurs")
+        return False
+    state = fm_state()
+    try:
+        category = fm_place("category_id", discord.CategoryChannel)
+        if category is None:
+            category = (discord.utils.get(guild.categories, name=FM_CATEGORY_NAME)
+                        or await guild.create_category(FM_CATEGORY_NAME))
+            state["category_id"] = str(category.id)
+
+        if fm_place("archive_category_id", discord.CategoryChannel) is None:
+            archive = (discord.utils.get(guild.categories, name=FM_ARCHIVE_CATEGORY_NAME)
+                       or await guild.create_category(FM_ARCHIVE_CATEGORY_NAME))
+            state["archive_category_id"] = str(archive.id)
+
+        if fm_place("welcome_channel_id", discord.TextChannel) is None:
+            welcome = discord.utils.get(guild.text_channels, name=FM_WELCOME_CHANNEL_NAME)
+            if welcome is None:
+                # Lecture seule pour tout le monde : on n'y fait que cliquer sur le bouton.
+                welcome = await guild.create_text_channel(
+                    FM_WELCOME_CHANNEL_NAME, category=category, position=0,
+                    topic="Clique sur le bouton pour creer ton salon FM prive.",
+                    overwrites={
+                        guild.default_role: discord.PermissionOverwrite(
+                            view_channel=True, read_message_history=True, send_messages=False,
+                            add_reactions=False, create_public_threads=False, create_private_threads=False,
+                        ),
+                        guild.me: discord.PermissionOverwrite(
+                            view_channel=True, send_messages=True, embed_links=True, read_message_history=True,
+                        ),
+                    },
+                )
+            state["welcome_channel_id"] = str(welcome.id)
+    except discord.Forbidden:
+        print("[Salons FM] Le bot n'a pas la permission \"Gerer les salons\" : salons FM desactives")
+        return False
+    finally:
+        save_data()
+    return True
+
+async def create_fm_channel(guild, member, raw_name, command_id=None):
+    if not FM_PERSONAL_CHANNELS:
+        raise ChannelError("Les salons FM personnels ne sont pas actives sur ce serveur.")
+    name = slugify(raw_name.strip()[:MAX_CHANNEL_NAME])
+    if not name:
+        raise ChannelError("Ce nom de salon n'est pas valable : utilise des lettres ou des chiffres.")
+    if len(active_channels_of(member.id)) >= FM_MAX_ACTIVE_CHANNELS:
+        raise ChannelError(
+            f"Tu as deja {FM_MAX_ACTIVE_CHANNELS} salons FM actifs : archives-en un avec /fmarchive."
+        )
+    # Categorie supprimee entre-temps : le bot la recree.
+    category = fm_place("category_id", discord.CategoryChannel)
+    if category is None and await ensure_fm_places():
+        category = fm_place("category_id", discord.CategoryChannel)
+    if category is None:
+        raise ChannelError("La categorie Forgemagie n'a pas pu etre creee.")
+
+    base = f"fm-{slugify(member.display_name) or member.id}-{name}"[:90]
+    existing = {channel.name for channel in category.channels}
+    channel_name, suffix = base, 2
+    while channel_name in existing:
+        channel_name, suffix = f"{base}-{suffix}", suffix + 1
+
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        member: discord.PermissionOverwrite(
+            view_channel=True, send_messages=True, attach_files=True,
+            read_message_history=True, use_application_commands=True,
+        ),
+        guild.me: discord.PermissionOverwrite(
+            view_channel=True, send_messages=True, embed_links=True,
+            read_message_history=True, manage_channels=True,
+        ),
+    }
+    channel = await guild.create_text_channel(
+        channel_name, category=category, overwrites=overwrites,
+        topic=f"Salon FM de {member.display_name}",
+    )
+
+    fm_channels()[str(channel.id)] = {
+        "owner_id": str(member.id),
+        "status": "active",
+        "created_at": now_iso(),
+        "last_activity": now_iso(),
+    }
+    sessions[str(channel.id)] = empty_session()
+    save_data()
+
+    await channel.send(embed=channel_welcome_embed())
+    created = {"author": site_author(member)}
+    if command_id:
+        created["commandId"] = command_id
+    await send_event(site_event("channel-created", f"{channel.id}-created", channel, **created))
+    await send_event(site_event("session-start", f"{channel.id}-start", channel, author=site_author(member)))
+    return channel
+
+async def archive_fm_channel(channel, message):
+    entry = fm_channels().get(str(channel.id))
+    if not entry or entry.get("status") != "active":
+        return
+    if await close_session_in_channel(channel):
+        await send_event(site_event("session-stop", f"{channel.id}-archive-stop", channel))
+
+    guild = channel.guild
+    overwrites = dict(channel.overwrites)
+    owner = guild.get_member(int(entry["owner_id"]))
+    if owner is not None:
+        overwrites[owner] = discord.PermissionOverwrite(view_channel=True, send_messages=False, read_message_history=True)
+    archive = fm_place("archive_category_id", discord.CategoryChannel)
+    if archive is None and await ensure_fm_places():
+        archive = fm_place("archive_category_id", discord.CategoryChannel)
+    await channel.edit(
+        category=archive or channel.category,
+        overwrites=overwrites,
+    )
+    entry["status"] = "archived"
+    entry["archived_at"] = now_iso()
+    save_data()
+    await channel.send(message)
+    await send_event(site_event("channel-archived", f"{channel.id}-archived", channel))
+
+class ChannelNameModal(discord.ui.Modal, title="Nouvelle séance de FM"):
+    channel_name = discord.ui.TextInput(
+        label="Nom du salon",
+        placeholder="Par exemple : mon rtograf",
+        min_length=1,
+        max_length=MAX_CHANNEL_NAME,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            channel = await create_fm_channel(interaction.guild, interaction.user, str(self.channel_name))
+        except ChannelError as error:
+            return await interaction.followup.send(str(error), ephemeral=True)
+        await interaction.followup.send(f"Ton salon est pret : {channel.mention}", ephemeral=True)
+
+# Emoji du bouton : l'icone de la Rune Ga Pa, enregistree comme emoji de l'application
+# (servie par le site Dofus Craft ; FM_BUTTON_EMOJI_URL permet d'en changer).
+BUTTON_EMOJI_NAME = "rune_ga_pa"
+BUTTON_EMOJI_URL = os.environ.get("FM_BUTTON_EMOJI_URL", "https://dofus-craft.dofus-craft.workers.dev/rune-ga-pa.png")
+button_emoji = "🔨"
+
+async def ensure_button_emoji():
+    """Retrouve ou cree l'emoji du bouton ; garde le marteau si c'est impossible."""
+    global button_emoji
+    try:
+        for emoji in await bot.fetch_application_emojis():
+            if emoji.name == BUTTON_EMOJI_NAME:
+                button_emoji = emoji
+                return
+        response = await asyncio.to_thread(requests.get, BUTTON_EMOJI_URL, timeout=10)
+        response.raise_for_status()
+        button_emoji = await bot.create_application_emoji(name=BUTTON_EMOJI_NAME, image=response.content)
+    except (discord.HTTPException, requests.RequestException) as error:
+        print(f"[Salons FM] Emoji du bouton indisponible, marteau utilise : {error}")
+
+class NewSessionView(discord.ui.View):
+    # Bouton "persistant" : il reste actif apres un redemarrage du bot.
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.new_session.emoji = button_emoji
+
+    @discord.ui.button(label="Nouvelle séance de FM", style=discord.ButtonStyle.success, custom_id=NEW_SESSION_BUTTON_ID)
+    async def new_session(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if len(active_channels_of(interaction.user.id)) >= FM_MAX_ACTIVE_CHANNELS:
+            return await interaction.response.send_message(
+                f"Tu as deja {FM_MAX_ACTIVE_CHANNELS} salons FM actifs : archives-en un avec /fmarchive.",
+                ephemeral=True,
+            )
+        await interaction.response.send_modal(ChannelNameModal())
+
+# Version du message d'accueil : a augmenter quand son texte change, pour que le bot
+# mette a jour le message deja publie au lieu d'en poster un nouveau.
+WELCOME_VERSION = 5
+
+# Apparence du message d'accueil : bleu du Zaap et une illustration du Zaap (servie
+# par le site Dofus Craft ; FM_WELCOME_IMAGE_URL permet d'en changer sans toucher au code).
+WELCOME_COLOR = discord.Color.from_rgb(54, 169, 225)
+WELCOME_IMAGE = os.environ.get("FM_WELCOME_IMAGE_URL", "https://dofus-craft.dofus-craft.workers.dev/fm-banner.jpg")
+SITE_PAGE = "https://dofus-craft.dofus-craft.workers.dev/forgemagie"
+
+# Message poste dans un salon FM qui vient d'etre cree : c'est la que les commandes servent.
+def channel_welcome_embed():
+    # Les commandes d'abord (c'est ce qu'on revient chercher), puis quoi faire.
+    embed = discord.Embed(
+        title="Ton salon FM est prêt",
+        description=(
+            "**Commandes**\n"
+            "`/fmtotal` · total en cours\n"
+            "`/fmstop` · fermer la session et voir le résumé\n"
+            "`/fmstart` · nouvelle session\n"
+            "`/fmreset` · remettre à zéro\n"
+            "`/fmarchive` · archiver le salon, FM terminée\n\n"
+            "Ta session est démarrée : poste ici tes **captures du chat** après tes achats à l'HDV."
+        ),
+        color=WELCOME_COLOR,
+    )
+    return embed
+
+def welcome_embed():
+    # Volontairement court : les commandes sont expliquees dans le salon cree.
+    embed = discord.Embed(
+        title="🔨  Forgemagie",
+        description=(
+            "Clique sur **Nouvelle séance de FM** pour créer ton salon privé : "
+            "seuls toi et le bot le voient, et ta session démarre aussitôt.\n\n"
+            f"[Tes séances sur le site Dofus Craft]({SITE_PAGE})"
+        ),
+        color=WELCOME_COLOR,
+    )
+    if WELCOME_IMAGE:
+        embed.set_image(url=WELCOME_IMAGE)
+    embed.set_footer(text="Illustration © Ankama")
+    return embed
+
+async def ensure_welcome_message():
+    channel = fm_place("welcome_channel_id", discord.TextChannel)
+    if channel is None:
+        return
+    state = fm_state()
+    message_id = state.get("welcome_message_id")
+    if message_id:
+        try:
+            message = await channel.fetch_message(int(message_id))
+            if state.get("welcome_version") != WELCOME_VERSION or state.get("welcome_emoji") != str(button_emoji):
+                await message.edit(embed=welcome_embed(), view=NewSessionView())
+                state["welcome_version"] = WELCOME_VERSION
+                state["welcome_emoji"] = str(button_emoji)
+                save_data()
+            return
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+    message = await channel.send(embed=welcome_embed(), view=NewSessionView())
+    state["welcome_message_id"] = str(message.id)
+    state["welcome_version"] = WELCOME_VERSION
+    state["welcome_emoji"] = str(button_emoji)
+    save_data()
+
 # ---------------- COMMANDES ---------------- #
 @bot.tree.command(name="fmstart", description="Demarrer une session FM")
 async def fmstart(interaction: discord.Interaction):
     channel_id = str(interaction.channel.id)
     sessions[channel_id] = empty_session()
+    touch_channel(channel_id)
     save_data()
     await interaction.response.send_message("Session FM demarree !")
+    await send_event(site_event(
+        "session-start", interaction.id, interaction.channel, interaction.created_at,
+        author=site_author(interaction.user),
+    ))
 
 @bot.tree.command(name="fmstop", description="Arreter la session et afficher le resume")
 async def fmstop(interaction: discord.Interaction):
@@ -176,32 +596,26 @@ async def fmstop(interaction: discord.Interaction):
         return await interaction.response.send_message("Aucune session active.")
 
     session = sessions[channel_id]
-    total = session["total"]
-    users = session["users"]
     runes = session.get("runes", {})
-
-    if users:
-        resume = "\n".join(
-            [f"<@{uid}> : {format_number(val)}" for uid, val in users.items()]
-        )
-    else:
-        resume = "Aucune donnee."
-
-    message_out = f"Resume final\n\n{resume}\n\nTOTAL : {format_number(total)} kamas"
+    message_out = session_summary(session, "Resume final")
 
     del sessions[channel_id]
+    touch_channel(channel_id)
     save_data()
 
     await interaction.response.send_message(message_out)
     if runes:
         await send_rune_embeds(interaction.followup.send, runes)
+    await send_event(site_event("session-stop", interaction.id, interaction.channel, interaction.created_at))
 
 @bot.tree.command(name="fmreset", description="Reinitialiser la session")
 async def fmreset(interaction: discord.Interaction):
     channel_id = str(interaction.channel.id)
     sessions[channel_id] = empty_session()
+    touch_channel(channel_id)
     save_data()
     await interaction.response.send_message("Session reinitialisee !")
+    await send_event(site_event("session-reset", interaction.id, interaction.channel, interaction.created_at))
 
 @bot.tree.command(name="fmtotal", description="Voir le total actuel")
 async def fmtotal(interaction: discord.Interaction):
@@ -210,34 +624,135 @@ async def fmtotal(interaction: discord.Interaction):
         return await interaction.response.send_message("Aucune session active.")
 
     session = sessions[channel_id]
-    total = session["total"]
-    users = session["users"]
     runes = session.get("runes", {})
-
-    if users:
-        resume = "\n".join(
-            [f"<@{uid}> : {format_number(val)}" for uid, val in users.items()]
-        )
-    else:
-        resume = "Aucune donnee."
-
-    message_out = f"Etat actuel\n\n{resume}\n\nTOTAL : {format_number(total)} kamas"
+    message_out = session_summary(session, "Etat actuel")
 
     await interaction.response.send_message(message_out)
     if runes:
         await send_rune_embeds(interaction.followup.send, runes)
+
+@bot.tree.command(name="fmarchive", description="Archiver ce salon FM (fin de la FM de l'objet)")
+async def fmarchive(interaction: discord.Interaction):
+    entry = fm_channels().get(str(interaction.channel.id))
+    if not entry or entry.get("status") != "active":
+        return await interaction.response.send_message("Ce salon n'est pas un salon FM actif.", ephemeral=True)
+    if entry.get("owner_id") != str(interaction.user.id):
+        return await interaction.response.send_message("Seul le proprietaire du salon peut l'archiver.", ephemeral=True)
+    await interaction.response.send_message("Archivage du salon...")
+    await archive_fm_channel(interaction.channel, "Salon archive : il reste consultable en lecture seule.")
 
 @bot.command()
 async def sync(ctx):
     await bot.tree.sync()
     await ctx.send("Commandes synchronisees !")
 
+# ---------------- TACHES DE FOND ---------------- #
+# Toutes les 10 secondes : les demandes du site (ouvrir / fermer une session,
+# creer un salon), puis les envois qui avaient echoue.
+@tasks.loop(seconds=10)
+async def poll_site():
+    await flush_pending_events()
+    response = await site_request("GET", "/fm/bot/commands")
+    if response is None or response.status_code != 200:
+        return
+    data = response.json()
+    interval = data.get("pollAfterSeconds")
+    if isinstance(interval, int) and interval >= 5 and interval != poll_site.seconds:
+        poll_site.change_interval(seconds=interval)
+
+    for command in data.get("commands", []):
+        command_id = command["id"]
+        if command_id in handled_commands:
+            continue
+        status, error, channel_id = "done", None, None
+        try:
+            if command["type"] == "create-channel":
+                guild = fm_guild()
+                if guild is None:
+                    raise ChannelError("Les salons FM personnels ne sont pas actives sur ce serveur.")
+                member = await guild.fetch_member(int(command["player"]["id"]))
+                channel = await create_fm_channel(guild, member, command["name"], command_id)
+                channel_id = channel.id
+            else:
+                channel = bot.get_channel(int(command["channelId"]))
+                if command["type"] == "open":
+                    if channel is None:
+                        raise ChannelError("Salon introuvable")
+                    sessions[str(channel.id)] = empty_session()
+                    touch_channel(channel.id)
+                    save_data()
+                    item = command.get("item")
+                    player = command.get("player") or {}
+                    await channel.send(
+                        f"Session FM demarree depuis le site par {player.get('displayName', 'un joueur')}"
+                        + (f" ({item['name']})" if item else "")
+                    )
+                elif command["type"] == "close" and channel is not None:
+                    await close_session_in_channel(channel)
+        except ChannelError as failure:
+            status, error = "failed", str(failure)
+        except discord.HTTPException as failure:
+            status, error = "failed", f"Discord a refuse : {failure.text or failure.status}"
+        if await ack_command(command_id, status, error, channel_id):
+            handled_commands.add(command_id)
+    if len(handled_commands) > 1000:
+        handled_commands.clear()
+
+# Toutes les heures : archive les salons FM sans activite depuis FM_INACTIVITY_DAYS jours.
+@tasks.loop(hours=1)
+async def archive_inactive_channels():
+    limit = discord.utils.utcnow() - datetime.timedelta(days=FM_INACTIVITY_DAYS)
+    for channel_id, entry in list(fm_channels().items()):
+        if entry.get("status") != "active":
+            continue
+        try:
+            last = datetime.datetime.fromisoformat(entry.get("last_activity", entry.get("created_at")))
+        except (TypeError, ValueError):
+            continue
+        channel = bot.get_channel(int(channel_id))
+        if last < limit and channel is not None:
+            await archive_fm_channel(channel, f"Salon archive automatiquement apres {FM_INACTIVITY_DAYS} jours sans activite.")
+
 # ---------------- EVENTS ---------------- #
+@bot.event
+async def setup_hook():
+    bot.add_view(NewSessionView())
+
 @bot.event
 async def on_ready():
     load_data()
     await bot.tree.sync()
     print(f"Bot connecte en tant que {bot.user}")
+    if FM_PERSONAL_CHANNELS and await ensure_fm_places():
+        await ensure_button_emoji()
+        await ensure_welcome_message()
+        if not archive_inactive_channels.is_running():
+            archive_inactive_channels.start()
+    if SITE_ENABLED and not poll_site.is_running():
+        poll_site.start()
+
+@bot.event
+async def on_member_remove(member):
+    for channel_id in active_channels_of(member.id):
+        channel = bot.get_channel(int(channel_id))
+        if channel is not None:
+            await archive_fm_channel(channel, f"Salon archive : {member.display_name} a quitte le serveur.")
+
+@bot.event
+async def on_guild_channel_delete(channel):
+    # Salon d'accueil ou categorie supprime : le bot les recree aussitot.
+    if FM_PERSONAL_CHANNELS and str(channel.id) in (
+        fm_state().get("welcome_channel_id"), fm_state().get("category_id"), fm_state().get("archive_category_id"),
+    ):
+        if await ensure_fm_places():
+            await ensure_welcome_message()
+        return
+    entry = fm_channels().get(str(channel.id))
+    if entry:
+        entry["status"] = "deleted"
+        sessions.pop(str(channel.id), None)
+        save_data()
+        await send_event(site_event("channel-deleted", f"{channel.id}-deleted", channel))
 
 @bot.event
 async def on_message(message):
@@ -259,6 +774,8 @@ async def on_message(message):
         added_total = 0
         details = []
         rune_totals = defaultdict(lambda: {"qty": 0, "price": 0})
+        # Chaque ligne lue, avant regroupement : c'est ce que le site recoit.
+        all_lines = []
 
         for attachment in message.attachments:
             if attachment.filename.lower().endswith(("png", "jpg", "jpeg")):
@@ -271,6 +788,7 @@ async def on_message(message):
                 for r in runes:
                     rune_totals[r["name"]]["qty"] += r["qty"]
                     rune_totals[r["name"]]["price"] += r["price"]
+                    all_lines.append(r)
 
         if added_total > 0:
             session["total"] += added_total
@@ -286,6 +804,7 @@ async def on_message(message):
             session["runes"][name]["price"] += vals["price"]
 
         if added_total > 0 or rune_totals:
+            touch_channel(channel_id)
             save_data()
 
         reply_parts = []
@@ -307,6 +826,12 @@ async def on_message(message):
 
         if reply_parts:
             await message.reply("\n\n".join(reply_parts))
+            await send_event(site_event(
+                "capture", message.id, message.channel, message.created_at,
+                author=site_author(message.author),
+                spentKamas=added_total,
+                lines=all_lines,
+            ))
 
     await bot.process_commands(message)
 
