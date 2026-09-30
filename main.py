@@ -41,20 +41,24 @@ SITE_URL = os.environ.get("DOFUS_CRAFT_API_URL", "").rstrip("/")
 SITE_KEY = os.environ.get("FM_BOT_API_KEY", "")
 SITE_ENABLED = bool(SITE_URL and SITE_KEY)
 
-# Salons FM personnels. Sans ces trois identifiants, le bouton et les salons
-# personnels sont desactives (les commandes /fm... marchent comme avant).
+# Salons FM personnels : actives par FM_PERSONAL_CHANNELS=1. Le bot cree alors lui-meme
+# les categories "Forgemagie" et "Archives FM" et le salon d'accueil #forgemagie (ou reprend
+# ceux qui existent deja sous ces noms). Sinon, les commandes /fm... marchent comme avant.
 def _int_env(name, default=0):
     try:
         return int(os.environ.get(name, default))
     except ValueError:
         return default
 
-FM_WELCOME_CHANNEL_ID = _int_env("FM_WELCOME_CHANNEL_ID")
-FM_CATEGORY_ID = _int_env("FM_CATEGORY_ID")
-FM_ARCHIVE_CATEGORY_ID = _int_env("FM_ARCHIVE_CATEGORY_ID")
+FM_PERSONAL_CHANNELS = os.environ.get("FM_PERSONAL_CHANNELS") == "1"
+# Seulement si le bot est sur plusieurs serveurs : celui ou creer les salons FM.
+FM_GUILD_ID = _int_env("FM_GUILD_ID")
 FM_MAX_ACTIVE_CHANNELS = _int_env("FM_MAX_ACTIVE_CHANNELS", 5)
 FM_INACTIVITY_DAYS = _int_env("FM_INACTIVITY_DAYS", 14)
-CHANNELS_ENABLED = bool(FM_WELCOME_CHANNEL_ID and FM_CATEGORY_ID and FM_ARCHIVE_CATEGORY_ID)
+
+FM_CATEGORY_NAME = "Forgemagie"
+FM_ARCHIVE_CATEGORY_NAME = "Archives FM"
+FM_WELCOME_CHANNEL_NAME = "forgemagie"
 
 MAX_CHANNEL_NAME = 30
 NEW_SESSION_BUTTON_ID = "fm:new-session"
@@ -317,9 +321,65 @@ def active_channels_of(user_id):
 class ChannelError(Exception):
     """Une creation de salon impossible, avec le message a montrer au joueur."""
 
+def fm_guild():
+    if not FM_PERSONAL_CHANNELS:
+        return None
+    if FM_GUILD_ID:
+        return bot.get_guild(FM_GUILD_ID)
+    return bot.guilds[0] if len(bot.guilds) == 1 else None
+
+# Un des emplacements des salons FM, retrouve par l'identifiant garde dans data.json.
+def fm_place(key, kind):
+    channel = bot.get_channel(int(fm_state().get(key) or 0))
+    return channel if isinstance(channel, kind) else None
+
+async def ensure_fm_places():
+    """Trouve ou cree les categories Forgemagie et Archives FM et le salon d'accueil."""
+    guild = fm_guild()
+    if guild is None:
+        print("[Salons FM] Serveur introuvable : indique FM_GUILD_ID si le bot est sur plusieurs serveurs")
+        return False
+    state = fm_state()
+    try:
+        category = fm_place("category_id", discord.CategoryChannel)
+        if category is None:
+            category = (discord.utils.get(guild.categories, name=FM_CATEGORY_NAME)
+                        or await guild.create_category(FM_CATEGORY_NAME))
+            state["category_id"] = str(category.id)
+
+        if fm_place("archive_category_id", discord.CategoryChannel) is None:
+            archive = (discord.utils.get(guild.categories, name=FM_ARCHIVE_CATEGORY_NAME)
+                       or await guild.create_category(FM_ARCHIVE_CATEGORY_NAME))
+            state["archive_category_id"] = str(archive.id)
+
+        if fm_place("welcome_channel_id", discord.TextChannel) is None:
+            welcome = discord.utils.get(guild.text_channels, name=FM_WELCOME_CHANNEL_NAME)
+            if welcome is None:
+                # Lecture seule pour tout le monde : on n'y fait que cliquer sur le bouton.
+                welcome = await guild.create_text_channel(
+                    FM_WELCOME_CHANNEL_NAME, category=category, position=0,
+                    topic="Clique sur le bouton pour creer ton salon FM prive.",
+                    overwrites={
+                        guild.default_role: discord.PermissionOverwrite(
+                            view_channel=True, read_message_history=True, send_messages=False,
+                            add_reactions=False, create_public_threads=False, create_private_threads=False,
+                        ),
+                        guild.me: discord.PermissionOverwrite(
+                            view_channel=True, send_messages=True, embed_links=True, read_message_history=True,
+                        ),
+                    },
+                )
+            state["welcome_channel_id"] = str(welcome.id)
+    except discord.Forbidden:
+        print("[Salons FM] Le bot n'a pas la permission \"Gerer les salons\" : salons FM desactives")
+        return False
+    finally:
+        save_data()
+    return True
+
 async def create_fm_channel(guild, member, raw_name, command_id=None):
-    if not CHANNELS_ENABLED:
-        raise ChannelError("Les salons FM personnels ne sont pas configures sur ce serveur.")
+    if not FM_PERSONAL_CHANNELS:
+        raise ChannelError("Les salons FM personnels ne sont pas actives sur ce serveur.")
     name = slugify(raw_name.strip()[:MAX_CHANNEL_NAME])
     if not name:
         raise ChannelError("Ce nom de salon n'est pas valable : utilise des lettres ou des chiffres.")
@@ -327,9 +387,12 @@ async def create_fm_channel(guild, member, raw_name, command_id=None):
         raise ChannelError(
             f"Tu as deja {FM_MAX_ACTIVE_CHANNELS} salons FM actifs : archives-en un avec /fmarchive."
         )
-    category = guild.get_channel(FM_CATEGORY_ID)
-    if not isinstance(category, discord.CategoryChannel):
-        raise ChannelError("La categorie des salons FM est introuvable.")
+    # Categorie supprimee entre-temps : le bot la recree.
+    category = fm_place("category_id", discord.CategoryChannel)
+    if category is None and await ensure_fm_places():
+        category = fm_place("category_id", discord.CategoryChannel)
+    if category is None:
+        raise ChannelError("La categorie Forgemagie n'a pas pu etre creee.")
 
     base = f"fm-{slugify(member.display_name) or member.id}-{name}"[:90]
     existing = {channel.name for channel in category.channels}
@@ -362,7 +425,7 @@ async def create_fm_channel(guild, member, raw_name, command_id=None):
     sessions[str(channel.id)] = empty_session()
     save_data()
 
-    await channel.send(content=member.mention, embed=channel_welcome_embed())
+    await channel.send(embed=channel_welcome_embed())
     created = {"author": site_author(member)}
     if command_id:
         created["commandId"] = command_id
@@ -382,9 +445,11 @@ async def archive_fm_channel(channel, message):
     owner = guild.get_member(int(entry["owner_id"]))
     if owner is not None:
         overwrites[owner] = discord.PermissionOverwrite(view_channel=True, send_messages=False, read_message_history=True)
-    archive = guild.get_channel(FM_ARCHIVE_CATEGORY_ID)
+    archive = fm_place("archive_category_id", discord.CategoryChannel)
+    if archive is None and await ensure_fm_places():
+        archive = fm_place("archive_category_id", discord.CategoryChannel)
     await channel.edit(
-        category=archive if isinstance(archive, discord.CategoryChannel) else channel.category,
+        category=archive or channel.category,
         overwrites=overwrites,
     )
     entry["status"] = "archived"
@@ -409,12 +474,33 @@ class ChannelNameModal(discord.ui.Modal, title="Nouvelle séance de FM"):
             return await interaction.followup.send(str(error), ephemeral=True)
         await interaction.followup.send(f"Ton salon est pret : {channel.mention}", ephemeral=True)
 
+# Emoji du bouton : l'icone de la Rune Ga Pa, enregistree comme emoji de l'application
+# (servie par le site Dofus Craft ; FM_BUTTON_EMOJI_URL permet d'en changer).
+BUTTON_EMOJI_NAME = "rune_ga_pa"
+BUTTON_EMOJI_URL = os.environ.get("FM_BUTTON_EMOJI_URL", "https://dofus-craft.dofus-craft.workers.dev/rune-ga-pa.png")
+button_emoji = "🔨"
+
+async def ensure_button_emoji():
+    """Retrouve ou cree l'emoji du bouton ; garde le marteau si c'est impossible."""
+    global button_emoji
+    try:
+        for emoji in await bot.fetch_application_emojis():
+            if emoji.name == BUTTON_EMOJI_NAME:
+                button_emoji = emoji
+                return
+        response = await asyncio.to_thread(requests.get, BUTTON_EMOJI_URL, timeout=10)
+        response.raise_for_status()
+        button_emoji = await bot.create_application_emoji(name=BUTTON_EMOJI_NAME, image=response.content)
+    except (discord.HTTPException, requests.RequestException) as error:
+        print(f"[Salons FM] Emoji du bouton indisponible, marteau utilise : {error}")
+
 class NewSessionView(discord.ui.View):
     # Bouton "persistant" : il reste actif apres un redemarrage du bot.
     def __init__(self):
         super().__init__(timeout=None)
+        self.new_session.emoji = button_emoji
 
-    @discord.ui.button(label="Nouvelle séance de FM", emoji="🔨", style=discord.ButtonStyle.success, custom_id=NEW_SESSION_BUTTON_ID)
+    @discord.ui.button(label="Nouvelle séance de FM", style=discord.ButtonStyle.success, custom_id=NEW_SESSION_BUTTON_ID)
     async def new_session(self, interaction: discord.Interaction, button: discord.ui.Button):
         if len(active_channels_of(interaction.user.id)) >= FM_MAX_ACTIVE_CHANNELS:
             return await interaction.response.send_message(
@@ -468,18 +554,18 @@ def welcome_embed():
     return embed
 
 async def ensure_welcome_message():
-    channel = bot.get_channel(FM_WELCOME_CHANNEL_ID)
+    channel = fm_place("welcome_channel_id", discord.TextChannel)
     if channel is None:
-        print("[Salons FM] Salon d'accueil introuvable : verifie FM_WELCOME_CHANNEL_ID")
         return
     state = fm_state()
     message_id = state.get("welcome_message_id")
     if message_id:
         try:
             message = await channel.fetch_message(int(message_id))
-            if state.get("welcome_version") != WELCOME_VERSION:
+            if state.get("welcome_version") != WELCOME_VERSION or state.get("welcome_emoji") != str(button_emoji):
                 await message.edit(embed=welcome_embed(), view=NewSessionView())
                 state["welcome_version"] = WELCOME_VERSION
+                state["welcome_emoji"] = str(button_emoji)
                 save_data()
             return
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
@@ -487,6 +573,7 @@ async def ensure_welcome_message():
     message = await channel.send(embed=welcome_embed(), view=NewSessionView())
     state["welcome_message_id"] = str(message.id)
     state["welcome_version"] = WELCOME_VERSION
+    state["welcome_emoji"] = str(button_emoji)
     save_data()
 
 # ---------------- COMMANDES ---------------- #
@@ -580,11 +667,11 @@ async def poll_site():
         status, error, channel_id = "done", None, None
         try:
             if command["type"] == "create-channel":
-                category = bot.get_channel(FM_CATEGORY_ID)
-                if not CHANNELS_ENABLED or category is None:
-                    raise ChannelError("Les salons FM personnels ne sont pas configures sur ce serveur.")
-                member = await category.guild.fetch_member(int(command["player"]["id"]))
-                channel = await create_fm_channel(category.guild, member, command["name"], command_id)
+                guild = fm_guild()
+                if guild is None:
+                    raise ChannelError("Les salons FM personnels ne sont pas actives sur ce serveur.")
+                member = await guild.fetch_member(int(command["player"]["id"]))
+                channel = await create_fm_channel(guild, member, command["name"], command_id)
                 channel_id = channel.id
             else:
                 channel = bot.get_channel(int(command["channelId"]))
@@ -636,7 +723,8 @@ async def on_ready():
     load_data()
     await bot.tree.sync()
     print(f"Bot connecte en tant que {bot.user}")
-    if CHANNELS_ENABLED:
+    if FM_PERSONAL_CHANNELS and await ensure_fm_places():
+        await ensure_button_emoji()
         await ensure_welcome_message()
         if not archive_inactive_channels.is_running():
             archive_inactive_channels.start()
@@ -652,6 +740,13 @@ async def on_member_remove(member):
 
 @bot.event
 async def on_guild_channel_delete(channel):
+    # Salon d'accueil ou categorie supprime : le bot les recree aussitot.
+    if FM_PERSONAL_CHANNELS and str(channel.id) in (
+        fm_state().get("welcome_channel_id"), fm_state().get("category_id"), fm_state().get("archive_category_id"),
+    ):
+        if await ensure_fm_places():
+            await ensure_welcome_message()
+        return
     entry = fm_channels().get(str(channel.id))
     if entry:
         entry["status"] = "deleted"
