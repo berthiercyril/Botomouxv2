@@ -430,12 +430,14 @@ class NewSessionView(discord.ui.View):
 
 # Version du message d'accueil : a augmenter quand son texte change, pour que le bot
 # mette a jour le message deja publie au lieu d'en poster un nouveau.
-WELCOME_VERSION = 3
+WELCOME_VERSION = 4
 
-# Apparence du message d'accueil : dore comme l'interface de Dofus, avec l'icone
-# de la rune Ga Pa du jeu (image servie par DofusDB).
-WELCOME_COLOR = discord.Color.from_rgb(232, 176, 75)
+# Apparence du message d'accueil : bleu du Zaap, l'icone de la rune Ga Pa du jeu
+# (servie par DofusDB) et une illustration du Zaap (servie par le site Dofus Craft ;
+# FM_WELCOME_IMAGE_URL permet d'en changer sans toucher au code).
+WELCOME_COLOR = discord.Color.from_rgb(54, 169, 225)
 WELCOME_ICON = "https://api.dofusdb.fr/img/items/78055.png"
+WELCOME_IMAGE = os.environ.get("FM_WELCOME_IMAGE_URL", "https://dofus-craft.dofus-craft.workers.dev/fm-banner.jpg")
 SITE_PAGE = "https://dofus-craft.dofus-craft.workers.dev/forgemagie"
 
 def welcome_embed():
@@ -449,7 +451,8 @@ def welcome_embed():
         color=WELCOME_COLOR,
     )
     embed.set_author(name="Dofus Craft · Forgemagie", icon_url=WELCOME_ICON, url=SITE_PAGE)
-    embed.set_thumbnail(url=WELCOME_ICON)
+    if WELCOME_IMAGE:
+        embed.set_image(url=WELCOME_IMAGE)
     embed.add_field(
         name="📋  Comment ça marche",
         value=(
@@ -474,7 +477,7 @@ def welcome_embed():
     embed.add_field(name="📦  Limite", value=f"**{FM_MAX_ACTIVE_CHANNELS}** salons actifs par joueur", inline=True)
     embed.add_field(name="🗄️  Archivage", value=f"`/fmarchive` ou après **{FM_INACTIVITY_DAYS} jours** sans activité", inline=True)
     embed.add_field(name="🌐  Sur le site", value=f"[Page Forgemagie]({SITE_PAGE})", inline=True)
-    embed.set_footer(text="Tu peux aussi démarrer une séance depuis le site Dofus Craft.", icon_url=WELCOME_ICON)
+    embed.set_footer(text="Tu peux aussi démarrer une séance depuis le site Dofus Craft · Illustration © Ankama", icon_url=WELCOME_ICON)
     return embed
 
 async def ensure_welcome_message():
