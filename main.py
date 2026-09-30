@@ -398,7 +398,7 @@ async def archive_fm_channel(channel, message):
     await channel.send(message)
     await send_event(site_event("channel-archived", f"{channel.id}-archived", channel))
 
-class ChannelNameModal(discord.ui.Modal, title="Nouvelle seance de FM"):
+class ChannelNameModal(discord.ui.Modal, title="Nouvelle séance de FM"):
     channel_name = discord.ui.TextInput(
         label="Nom du salon",
         placeholder="Par exemple : mon rtograf",
@@ -419,7 +419,7 @@ class NewSessionView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Nouvelle seance de FM", emoji="➕", style=discord.ButtonStyle.primary, custom_id=NEW_SESSION_BUTTON_ID)
+    @discord.ui.button(label="Nouvelle séance de FM", emoji="🔨", style=discord.ButtonStyle.success, custom_id=NEW_SESSION_BUTTON_ID)
     async def new_session(self, interaction: discord.Interaction, button: discord.ui.Button):
         if len(active_channels_of(interaction.user.id)) >= FM_MAX_ACTIVE_CHANNELS:
             return await interaction.response.send_message(
@@ -430,49 +430,51 @@ class NewSessionView(discord.ui.View):
 
 # Version du message d'accueil : a augmenter quand son texte change, pour que le bot
 # mette a jour le message deja publie au lieu d'en poster un nouveau.
-WELCOME_VERSION = 2
+WELCOME_VERSION = 3
+
+# Apparence du message d'accueil : dore comme l'interface de Dofus, avec l'icone
+# de la rune Ga Pa du jeu (image servie par DofusDB).
+WELCOME_COLOR = discord.Color.from_rgb(232, 176, 75)
+WELCOME_ICON = "https://api.dofusdb.fr/img/items/78055.png"
+SITE_PAGE = "https://dofus-craft.dofus-craft.workers.dev/forgemagie"
 
 def welcome_embed():
     embed = discord.Embed(
-        title="Forgemagie : tes seances de FM",
+        title="🔨  Ta séance de forgemagie",
         description=(
-            "Clique sur **Nouvelle seance de FM** pour creer ton salon FM prive : "
-            "visible seulement par toi et le bot. Donne-lui le nom que tu veux "
-            "(par exemple l'objet que tu forgemages) : une session y demarre tout de suite."
+            "Crée ton **salon FM privé** en un clic : seuls **toi** et le bot le voient.\n"
+            "Donne-lui le nom que tu veux (l'objet que tu forgemages, par exemple) "
+            "et ta session démarre aussitôt."
         ),
-        color=discord.Color.blurple(),
+        color=WELCOME_COLOR,
     )
+    embed.set_author(name="Dofus Craft · Forgemagie", icon_url=WELCOME_ICON, url=SITE_PAGE)
+    embed.set_thumbnail(url=WELCOME_ICON)
     embed.add_field(
-        name="Comment ca marche",
+        name="📋  Comment ça marche",
         value=(
-            "1. Clique sur le bouton et choisis un nom de salon.\n"
-            "2. Dans ton salon, poste tes captures du chat apres tes achats a l'HDV.\n"
-            "3. Le bot compte tes depenses et tes runes, capture apres capture.\n"
-            "4. Tu retrouves tout sur le site Dofus Craft, page Forgemagie."
+            "1️⃣  Clique sur **Nouvelle séance de FM** et choisis un nom.\n"
+            "2️⃣  Dans ton salon, poste tes **captures du chat** après tes achats à l'HDV.\n"
+            "3️⃣  Le bot compte tes **dépenses** et tes **runes**, capture après capture.\n"
+            "4️⃣  Retrouve tout sur le **site**, avec le coût total de chaque objet."
         ),
         inline=False,
     )
     embed.add_field(
-        name="Commandes dans ton salon",
+        name="⌨️  Commandes dans ton salon",
         value=(
-            "`/fmtotal` : total de la session en cours\n"
-            "`/fmstop` : fermer la session et afficher le resume\n"
-            "`/fmstart` : demarrer une nouvelle session dans le salon\n"
-            "`/fmreset` : remettre la session a zero\n"
-            "`/fmarchive` : archiver le salon quand la FM de l'objet est terminee"
+            "`/fmtotal` · total de la session en cours\n"
+            "`/fmstop` · fermer la session et voir le résumé\n"
+            "`/fmstart` · démarrer une nouvelle session\n"
+            "`/fmreset` · remettre la session à zéro\n"
+            "`/fmarchive` · archiver le salon, FM terminée"
         ),
         inline=False,
     )
-    embed.add_field(
-        name="Limites",
-        value=(
-            f"{FM_MAX_ACTIVE_CHANNELS} salons actifs au maximum par joueur. "
-            f"Un salon sans activite pendant {FM_INACTIVITY_DAYS} jours est archive automatiquement ; "
-            "un salon archive reste consultable en lecture seule."
-        ),
-        inline=False,
-    )
-    embed.set_footer(text="Tu peux aussi demarrer une seance depuis le site Dofus Craft.")
+    embed.add_field(name="📦  Limite", value=f"**{FM_MAX_ACTIVE_CHANNELS}** salons actifs par joueur", inline=True)
+    embed.add_field(name="🗄️  Archivage", value=f"`/fmarchive` ou après **{FM_INACTIVITY_DAYS} jours** sans activité", inline=True)
+    embed.add_field(name="🌐  Sur le site", value=f"[Page Forgemagie]({SITE_PAGE})", inline=True)
+    embed.set_footer(text="Tu peux aussi démarrer une séance depuis le site Dofus Craft.", icon_url=WELCOME_ICON)
     return embed
 
 async def ensure_welcome_message():
