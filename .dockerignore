@@ -1,6 +1,0 @@
-# Ne jamais copier les secrets ni les donnees dans l image : .env reste sur la machine,
-# data.json est monte par docker-compose.
-.env
-data.json
-.git
-__pycache__/
