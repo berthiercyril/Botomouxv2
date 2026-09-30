@@ -428,29 +428,73 @@ class NewSessionView(discord.ui.View):
             )
         await interaction.response.send_modal(ChannelNameModal())
 
+# Version du message d'accueil : a augmenter quand son texte change, pour que le bot
+# mette a jour le message deja publie au lieu d'en poster un nouveau.
+WELCOME_VERSION = 2
+
+def welcome_embed():
+    embed = discord.Embed(
+        title="Forgemagie : tes seances de FM",
+        description=(
+            "Clique sur **Nouvelle seance de FM** pour creer ton salon FM prive : "
+            "visible seulement par toi et le bot. Donne-lui le nom que tu veux "
+            "(par exemple l'objet que tu forgemages) : une session y demarre tout de suite."
+        ),
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(
+        name="Comment ca marche",
+        value=(
+            "1. Clique sur le bouton et choisis un nom de salon.\n"
+            "2. Dans ton salon, poste tes captures du chat apres tes achats a l'HDV.\n"
+            "3. Le bot compte tes depenses et tes runes, capture apres capture.\n"
+            "4. Tu retrouves tout sur le site Dofus Craft, page Forgemagie."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Commandes dans ton salon",
+        value=(
+            "`/fmtotal` : total de la session en cours\n"
+            "`/fmstop` : fermer la session et afficher le resume\n"
+            "`/fmstart` : demarrer une nouvelle session dans le salon\n"
+            "`/fmreset` : remettre la session a zero\n"
+            "`/fmarchive` : archiver le salon quand la FM de l'objet est terminee"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Limites",
+        value=(
+            f"{FM_MAX_ACTIVE_CHANNELS} salons actifs au maximum par joueur. "
+            f"Un salon sans activite pendant {FM_INACTIVITY_DAYS} jours est archive automatiquement ; "
+            "un salon archive reste consultable en lecture seule."
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="Tu peux aussi demarrer une seance depuis le site Dofus Craft.")
+    return embed
+
 async def ensure_welcome_message():
     channel = bot.get_channel(FM_WELCOME_CHANNEL_ID)
     if channel is None:
         print("[Salons FM] Salon d'accueil introuvable : verifie FM_WELCOME_CHANNEL_ID")
         return
-    message_id = fm_state().get("welcome_message_id")
+    state = fm_state()
+    message_id = state.get("welcome_message_id")
     if message_id:
         try:
-            await channel.fetch_message(int(message_id))
+            message = await channel.fetch_message(int(message_id))
+            if state.get("welcome_version") != WELCOME_VERSION:
+                await message.edit(embed=welcome_embed(), view=NewSessionView())
+                state["welcome_version"] = WELCOME_VERSION
+                save_data()
             return
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             pass
-    embed = discord.Embed(
-        title="Forgemagie",
-        description=(
-            "Clique sur le bouton pour creer ton salon FM prive : "
-            "visible seulement par toi et le bot, une session y demarre tout de suite.\n"
-            f"{FM_MAX_ACTIVE_CHANNELS} salons actifs au maximum par joueur ; /fmarchive pour en archiver un."
-        ),
-        color=discord.Color.blurple(),
-    )
-    message = await channel.send(embed=embed, view=NewSessionView())
-    fm_state()["welcome_message_id"] = str(message.id)
+    message = await channel.send(embed=welcome_embed(), view=NewSessionView())
+    state["welcome_message_id"] = str(message.id)
+    state["welcome_version"] = WELCOME_VERSION
     save_data()
 
 # ---------------- COMMANDES ---------------- #
