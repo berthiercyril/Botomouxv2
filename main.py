@@ -362,12 +362,7 @@ async def create_fm_channel(guild, member, raw_name, command_id=None):
     sessions[str(channel.id)] = empty_session()
     save_data()
 
-    await channel.send(
-        f"{member.mention} ton salon FM est pret et une session est demarree !\n"
-        "Poste ici tes captures du chat apres tes achats a l'HDV.\n"
-        "/fmtotal pour le total, /fmstop pour le resume, /fmstart pour une nouvelle session, "
-        "/fmarchive quand la FM de cet objet est terminee."
-    )
+    await channel.send(content=member.mention, embed=channel_welcome_embed())
     created = {"author": site_author(member)}
     if command_id:
         created["commandId"] = command_id
@@ -430,54 +425,46 @@ class NewSessionView(discord.ui.View):
 
 # Version du message d'accueil : a augmenter quand son texte change, pour que le bot
 # mette a jour le message deja publie au lieu d'en poster un nouveau.
-WELCOME_VERSION = 4
+WELCOME_VERSION = 5
 
-# Apparence du message d'accueil : bleu du Zaap, l'icone de la rune Ga Pa du jeu
-# (servie par DofusDB) et une illustration du Zaap (servie par le site Dofus Craft ;
-# FM_WELCOME_IMAGE_URL permet d'en changer sans toucher au code).
+# Apparence du message d'accueil : bleu du Zaap et une illustration du Zaap (servie
+# par le site Dofus Craft ; FM_WELCOME_IMAGE_URL permet d'en changer sans toucher au code).
 WELCOME_COLOR = discord.Color.from_rgb(54, 169, 225)
-WELCOME_ICON = "https://api.dofusdb.fr/img/items/78055.png"
 WELCOME_IMAGE = os.environ.get("FM_WELCOME_IMAGE_URL", "https://dofus-craft.dofus-craft.workers.dev/fm-banner.jpg")
 SITE_PAGE = "https://dofus-craft.dofus-craft.workers.dev/forgemagie"
 
-def welcome_embed():
+# Message poste dans un salon FM qui vient d'etre cree : c'est la que les commandes servent.
+def channel_welcome_embed():
+    # Les commandes d'abord (c'est ce qu'on revient chercher), puis quoi faire.
     embed = discord.Embed(
-        title="🔨  Ta séance de forgemagie",
+        title="Ton salon FM est prêt",
         description=(
-            "Crée ton **salon FM privé** en un clic : seuls **toi** et le bot le voient.\n"
-            "Donne-lui le nom que tu veux (l'objet que tu forgemages, par exemple) "
-            "et ta session démarre aussitôt."
+            "**Commandes**\n"
+            "`/fmtotal` · total en cours\n"
+            "`/fmstop` · fermer la session et voir le résumé\n"
+            "`/fmstart` · nouvelle session\n"
+            "`/fmreset` · remettre à zéro\n"
+            "`/fmarchive` · archiver le salon, FM terminée\n\n"
+            "Ta session est démarrée : poste ici tes **captures du chat** après tes achats à l'HDV."
         ),
         color=WELCOME_COLOR,
     )
-    embed.set_author(name="Dofus Craft · Forgemagie", icon_url=WELCOME_ICON, url=SITE_PAGE)
+    return embed
+
+def welcome_embed():
+    # Volontairement court : les commandes sont expliquees dans le salon cree.
+    embed = discord.Embed(
+        title="🔨  Forgemagie",
+        description=(
+            "Clique sur **Nouvelle séance de FM** pour créer ton salon privé : "
+            "seuls toi et le bot le voient, et ta session démarre aussitôt.\n\n"
+            f"[Tes séances sur le site Dofus Craft]({SITE_PAGE})"
+        ),
+        color=WELCOME_COLOR,
+    )
     if WELCOME_IMAGE:
         embed.set_image(url=WELCOME_IMAGE)
-    embed.add_field(
-        name="📋  Comment ça marche",
-        value=(
-            "1️⃣  Clique sur **Nouvelle séance de FM** et choisis un nom.\n"
-            "2️⃣  Dans ton salon, poste tes **captures du chat** après tes achats à l'HDV.\n"
-            "3️⃣  Le bot compte tes **dépenses** et tes **runes**, capture après capture.\n"
-            "4️⃣  Retrouve tout sur le **site**, avec le coût total de chaque objet."
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name="⌨️  Commandes dans ton salon",
-        value=(
-            "`/fmtotal` · total de la session en cours\n"
-            "`/fmstop` · fermer la session et voir le résumé\n"
-            "`/fmstart` · démarrer une nouvelle session\n"
-            "`/fmreset` · remettre la session à zéro\n"
-            "`/fmarchive` · archiver le salon, FM terminée"
-        ),
-        inline=False,
-    )
-    embed.add_field(name="📦  Limite", value=f"**{FM_MAX_ACTIVE_CHANNELS}** salons actifs par joueur", inline=True)
-    embed.add_field(name="🗄️  Archivage", value=f"`/fmarchive` ou après **{FM_INACTIVITY_DAYS} jours** sans activité", inline=True)
-    embed.add_field(name="🌐  Sur le site", value=f"[Page Forgemagie]({SITE_PAGE})", inline=True)
-    embed.set_footer(text="Tu peux aussi démarrer une séance depuis le site Dofus Craft · Illustration © Ankama", icon_url=WELCOME_ICON)
+    embed.set_footer(text="Illustration © Ankama")
     return embed
 
 async def ensure_welcome_message():
