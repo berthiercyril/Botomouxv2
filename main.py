@@ -329,15 +329,22 @@ def fm_guild():
     return bot.guilds[0] if len(bot.guilds) == 1 else None
 
 # Un des emplacements des salons FM, retrouve par l'identifiant garde dans data.json.
+# Un emplacement garde pour un autre serveur (FM_GUILD_ID a change) ne compte pas :
+# il sera cherche ou cree sur le bon serveur.
 def fm_place(key, kind):
     channel = bot.get_channel(int(fm_state().get(key) or 0))
-    return channel if isinstance(channel, kind) else None
+    if not isinstance(channel, kind) or channel.guild != fm_guild():
+        return None
+    return channel
 
 async def ensure_fm_places():
     """Trouve ou cree les categories Forgemagie et Archives FM et le salon d'accueil."""
     guild = fm_guild()
     if guild is None:
-        print("[Salons FM] Serveur introuvable : indique FM_GUILD_ID si le bot est sur plusieurs serveurs")
+        if FM_GUILD_ID:
+            print(f"[Salons FM] Le bot n'est pas sur le serveur {FM_GUILD_ID} : verifie FM_GUILD_ID")
+        else:
+            print("[Salons FM] Le bot est sur plusieurs serveurs : indique FM_GUILD_ID")
         return False
     state = fm_state()
     try:
